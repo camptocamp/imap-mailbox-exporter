@@ -13,6 +13,10 @@ import (
   "github.com/mxk/go-imap/imap"
 )
 
+type ImapState struct {
+  nb_messages int
+  up int
+}
 
 type Exporter struct {
   mailserver string
@@ -21,6 +25,7 @@ type Exporter struct {
   mailbox string
   minQueryInterval time.Duration
   lastQuery time.Time
+  lastState ImapState
   mutex sync.Mutex
 
   up *prometheus.Desc
@@ -53,8 +58,10 @@ func (exp *Exporter) Describe(ch chan<- *prometheus.Desc) {
   exp.nbMessages.Describe(ch)
 }
 
-func (exp *Exporter) collect(ch chan<- prometheus.Metric) error {
-  ch <- prometheus.MustNewConstMetric(exp.up, prometheus.GaugeValue, 1)
+func (exp *Exporter) queryImapServer() ImapState {
+  state := exp.lastState
+  exp.lastQuery = time.Now()
+
   var (
     client *imap.Client
     err error
@@ -62,7 +69,10 @@ func (exp *Exporter) collect(ch chan<- prometheus.Metric) error {
 
   // Connect to the server
   client, err = imap.Dial(exp.mailserver)
-  if err != nil { log.Fatal(err) }
+  if err != nil {
+    state.up = 0
+    return state
+  }
 
   // Remember to log out and close the connection when finished
   defer client.Logout(30 * time.Second)
@@ -84,16 +94,29 @@ func (exp *Exporter) collect(ch chan<- prometheus.Metric) error {
   // Open a mailbox read-only (synchronous command - no need for imap.Wait)
   client.Select(exp.mailbox, true)
 
-  exp.nbMessages.Set(float64(client.Mailbox.Messages))
+  state.up = 1
+  state.nb_messages = int(client.Mailbox.Messages)
+
+  return state
+}
+
+func (exp *Exporter) collect(ch chan<- prometheus.Metric) error {
+
+  state := exp.lastState
+  if time.Since(exp.lastQuery) >= exp.minQueryInterval {
+    state = exp.queryImapServer()
+    exp.lastState = state
+  }
+
+  exp.nbMessages.Set(float64(state.nb_messages))
   exp.nbMessages.Collect(ch)
+  ch <- prometheus.MustNewConstMetric(exp.up, prometheus.GaugeValue, float64(state.up))
+
   return nil
 }
 
 func (exp *Exporter) Collect(ch chan<- prometheus.Metric) {
-  if time.Since(exp.lastQuery) < exp.minQueryInterval { return }
-
   exp.mutex.Lock() // To protect metrics from concurrent collects.
-  exp.lastQuery = time.Now()
   defer exp.mutex.Unlock()
   if err := exp.collect(ch); err != nil {
     log.Fatal("Scraping failure!")
